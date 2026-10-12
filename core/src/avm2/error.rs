@@ -1047,6 +1047,7 @@ pub fn make_error_2012<'gc>(
 make_error_fn!(make_error_2015, 2015, argument_error);
 make_error_fn!(make_error_2017, 2017, security_error);
 make_error_fn!(make_error_2018, 2018, security_error);
+make_error_fn!(make_error_2029, 2029, io_error);
 
 #[inline(never)]
 #[cold]
