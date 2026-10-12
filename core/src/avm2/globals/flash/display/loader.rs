@@ -332,3 +332,42 @@ pub fn unload<'gc>(
 
     Ok(Value::Undefined)
 }
+
+/// Implements `flash.display.Loader.unloadAndStop`.
+///
+/// On top of `unload()`, this stops the unloaded movie from being ticked: Flash
+/// documents it as stopping "the execution of commands from loaded SWF files",
+/// and measuring a real Flash projector shows that the content receives exactly
+/// one more frame tick and none after that.
+///
+/// Note what it does *not* do: the content's listeners stay registered, so
+/// `hasEventListener` still reports them and ordinary events (a `click`
+/// dispatched at an object of the parent movie, say) still reach it. That is
+/// what Flash does - matching it matters, because content that keeps reaching
+/// for a parent it no longer has is a bug in the content, not something to
+/// paper over here.
+pub fn unload_and_stop<'gc>(
+    activation: &mut Activation<'_, 'gc>,
+    this: Value<'gc>,
+    _args: FunctionArgs<'_, 'gc>,
+) -> Result<Value<'gc>, Error<'gc>> {
+    let this = this.as_object().unwrap();
+
+    let loader_info = this
+        .get_slot(loader_slots::_CONTENT_LOADER_INFO)
+        .as_object()
+        .unwrap();
+
+    let loader_info = loader_info.as_loader_info_object().unwrap();
+
+    // Taken before `unload()` resets the loader stream. The mark only takes
+    // effect once the frame broadcast currently running is over, which is what
+    // gives the content its one last tick.
+    if let LoaderStream::Swf(movie, _) = loader_info.loader_stream() {
+        activation.context.avm2.stop_ticking_movie(movie);
+    }
+
+    loader_info.unload(activation.context);
+
+    Ok(Value::Undefined)
+}

@@ -21,7 +21,7 @@ use crate::character::Character;
 use crate::context::UpdateContext;
 use crate::display_object::{DisplayObject, MovieClip, TDisplayObject};
 use crate::string::{AvmString, StringContext};
-use crate::tag_utils::SwfMovie;
+use crate::tag_utils::{SwfMovie, SwfMovieWeak};
 use crate::{PlayerMode, PlayerRuntime};
 
 use fnv::FnvHashMap;
@@ -170,6 +170,23 @@ pub struct Avm2<'gc> {
     /// currently present on the display list. This list keeps track of that.
     broadcast_list: FnvHashMap<AvmString<'gc>, Vec<WeakObject<'gc>>>,
 
+    /// Movies whose content has been unloaded by `Loader.unloadAndStop()`.
+    ///
+    /// Flash stops ticking that content: its display objects keep their
+    /// listeners (and still receive ordinary events, such as `click`), but they
+    /// no longer take part in the frame broadcasts. See
+    /// `globals::flash::display::loader::unload_and_stop`.
+    ///
+    /// These are weak, so noting an unloaded movie never keeps its data alive -
+    /// a `SwfMovie` owns the whole uncompressed SWF.
+    stopped_movies: Vec<SwfMovieWeak<'gc>>,
+
+    /// Marks made by `Loader.unloadAndStop()` while a frame broadcast was
+    /// already running. They move into `stopped_movies` once that pass is over,
+    /// so the content still receives the tick it was in the middle of - Flash
+    /// gives it exactly one more.
+    pending_stopped_movies: Vec<SwfMovieWeak<'gc>>,
+
     alias_to_class_map: FnvHashMap<AvmString<'gc>, ClassObject<'gc>>,
     class_to_alias_map: FnvHashMap<Class<'gc>, AvmString<'gc>>,
 
@@ -226,6 +243,8 @@ impl<'gc> Avm2<'gc> {
             native_custom_constructor_table: Default::default(),
             native_fast_call_list: Default::default(),
             broadcast_list: Default::default(),
+            stopped_movies: Default::default(),
+            pending_stopped_movies: Default::default(),
 
             alias_to_class_map: Default::default(),
             class_to_alias_map: Default::default(),
@@ -397,6 +416,23 @@ impl<'gc> Avm2<'gc> {
         bucket.push(object.downgrade());
     }
 
+    /// Record that `Loader.unloadAndStop()` has unloaded this movie's content.
+    ///
+    /// Its display objects stop taking part in the frame broadcasts from the
+    /// end of the pass that is currently running - see `stopped_movies`.
+    pub fn stop_ticking_movie(&mut self, movie: SwfMovie<'gc>) {
+        self.pending_stopped_movies.push(movie.downgrade());
+    }
+
+    /// Has this movie's content been unloaded by `Loader.unloadAndStop()`?
+    fn movie_stopped_ticking(&self, mc: &Mutation<'gc>, movie: SwfMovie<'gc>) -> bool {
+        self.stopped_movies.iter().any(|other| {
+            other
+                .upgrade(mc)
+                .is_some_and(|other| SwfMovie::ptr_eq(&other, &movie))
+        })
+    }
+
     /// Dispatch an event on all objects in the current execution list.
     ///
     /// `on_type` specifies a class or interface constructor whose instances,
@@ -426,6 +462,8 @@ impl<'gc> Avm2<'gc> {
             .or_default()
             .len();
 
+        let mc = context.gc();
+
         for i in 0..el_length {
             let object = context
                 .avm2
@@ -438,6 +476,14 @@ impl<'gc> Avm2<'gc> {
             if let Some(object) = object.and_then(|obj| obj.upgrade(context.gc()))
                 && object.is_of_type(on_type.inner_class_definition())
             {
+                // Content unloaded by `Loader.unloadAndStop()` keeps its
+                // listeners, but is no longer ticked.
+                if let Some(dobj) = object.as_display_object()
+                    && context.avm2.movie_stopped_ticking(mc, dobj.movie())
+                {
+                    continue;
+                }
+
                 let mut activation = Activation::from_nothing(context);
 
                 events::broadcast_event(&mut activation, object, event);
@@ -450,6 +496,20 @@ impl<'gc> Avm2<'gc> {
             .entry(event_name)
             .or_default()
             .retain(|x| x.upgrade(context.gc_context).is_some());
+
+        // Marks made while this pass was running take effect now, so content
+        // unloaded in the middle of one still received the tick it was in the
+        // middle of - Flash gives it exactly one more. Entries whose movie has
+        // since been collected can be dropped.
+        let mc = context.gc();
+        context
+            .avm2
+            .stopped_movies
+            .append(&mut context.avm2.pending_stopped_movies);
+        context
+            .avm2
+            .stopped_movies
+            .retain(|movie| movie.upgrade(mc).is_some());
     }
 
     pub fn lookup_class_for_character(

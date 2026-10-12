@@ -1,0 +1,20 @@
+child clickListenerRegistered    = true
+child enterFrame listener before = true
+parentBtn CLICK listener before  = true
+--- unloadAndStop() + removeChild(loader) ---
+child enterFrame listener after  = true
+parentBtn CLICK listener after   = true
+child click handler ran (dispatch #1) = true
+--- window 1: the 37 frames after the unload ---
+ticks the unloaded movie got     = 1
+times the game's statement threw = 1
+last error id                    = 1009
+root non-null                    = true
+root.parent non-null             = false
+root.parent.parent non-null      = false
+--- window 2: 20 frames much later ---
+ticks the unloaded movie got     = 0
+times the game's statement threw = 0
+child click handler ran (dispatch #2) = true
+PROBE_DONE
+PROBE_SOL_WRITTEN

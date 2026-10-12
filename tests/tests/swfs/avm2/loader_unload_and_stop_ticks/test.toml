@@ -1,0 +1,20 @@
+# `output.txt` was recorded from a real Flash projector (jplt.exe, which
+# embeds Flash Player): after `Loader.unloadAndStop()` the unloaded movie
+# receives exactly ONE more frame tick and none after that. Its listeners stay
+# registered throughout - see the `hasEventListener` lines - so the content is
+# stopped by no longer being ticked, not by dropping its listeners.
+num_ticks = 90
+
+[[compilers]]
+type = "Asc"
+target = "test.swf"
+class = "Probe"
+scripts = ["Probe.as"]
+swf_version = 41
+
+[[compilers]]
+type = "Asc"
+target = "child.swf"
+class = "ProbeChild"
+scripts = ["ProbeChild.as"]
+swf_version = 41
