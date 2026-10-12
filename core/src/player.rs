@@ -2075,6 +2075,10 @@ impl Player {
         }
 
         self.update(|context| {
+            // Bound GPU memory usage by periodically releasing stale
+            // textures/meshes (see `Library::tick_gpu_resources`).
+            context.library.tick_gpu_resources(context.renderer);
+
             // TODO: Is this order correct?
             run_all_phases_avm2(context);
             Avm1::run_frame(context);

@@ -1,4 +1,4 @@
-use std::cell::OnceCell;
+use std::cell::{Cell, RefCell};
 
 use crate::backend::audio::SoundHandle;
 use crate::binary_data::BinaryData;
@@ -38,7 +38,16 @@ pub struct BitmapCharacter<'gc> {
     compressed: CompressedBitmap,
     /// A lazily constructed GPU handle, used when performing fills with this bitmap
     #[collect(require_static)]
-    handle: OnceCell<BitmapHandle>,
+    handle: RefCell<Option<BitmapHandle>>,
+    /// The texture-clock tick at which this bitmap's GPU handle was last
+    /// used, used by the GPU resource sweeper to evict long-unused bitmap
+    /// textures.
+    #[collect(require_static)]
+    last_used: Cell<u64>,
+    /// Size in bytes of the GPU texture backing `handle` (RGBA8), used for
+    /// the GPU memory account.
+    #[collect(require_static)]
+    bytes: Cell<u64>,
     /// The bitmap class set by `SymbolClass` - this is used when we instantaite
     /// a `Bitmap` displayobject.
     avm2_class: Lock<BitmapClass<'gc>>,
@@ -48,7 +57,9 @@ impl<'gc> BitmapCharacter<'gc> {
     pub fn new(compressed: CompressedBitmap) -> Self {
         Self {
             compressed,
-            handle: OnceCell::default(),
+            handle: RefCell::new(None),
+            last_used: Cell::new(0),
+            bytes: Cell::new(0),
             avm2_class: Lock::new(BitmapClass::NoSubclass),
         }
     }
@@ -69,15 +80,49 @@ impl<'gc> BitmapCharacter<'gc> {
         &self,
         backend: &mut dyn RenderBackend,
     ) -> Result<BitmapHandle, RenderError> {
-        // FIXME - use `OnceCell::get_or_try_init` when stabilized.
-        if let Some(handle) = self.handle.get() {
-            return Ok(handle.clone());
+        // Requesting the handle *is* the use: stamp it, so the sweeper only
+        // evicts textures that have genuinely gone unused.
+        self.last_used.set(crate::library::texture_clock());
+        if let Some(handle) = self.handle.borrow().clone() {
+            return Ok(handle);
         }
         let decoded = self.compressed.decode()?;
+        let bytes = u64::from(decoded.width()) * u64::from(decoded.height()) * 4;
         let new_handle = backend.register_bitmap(decoded)?;
-        // FIXME - do we ever want to release this handle, to avoid taking up GPU memory?
-        self.handle.set(new_handle.clone()).unwrap();
+        // The handle is dropped again by the GPU resource sweeper when the
+        // bitmap goes unused, and lazily re-created here on the next request.
+        self.bytes.set(bytes);
+        crate::library::add_gpu_texture_bytes(bytes);
+        *self.handle.borrow_mut() = Some(new_handle.clone());
         Ok(new_handle)
+    }
+
+    /// Drops the cached GPU handle for this bitmap, if one was created.
+    ///
+    /// The handle is lazily re-created by [`Self::bitmap_handle`] if this
+    /// bitmap is rendered again.
+    pub fn release_gpu_handle(&self) {
+        if let Some(handle) = self.handle.borrow_mut().take() {
+            drop(handle);
+            crate::library::subtract_gpu_texture_bytes(self.bytes.get());
+            self.bytes.set(0);
+        }
+    }
+
+    /// The texture-clock tick at which this bitmap's GPU handle was last used.
+    pub fn last_used(&self) -> u64 {
+        self.last_used.get()
+    }
+
+    /// Size in bytes of the GPU texture registered for this bitmap, or 0 if
+    /// no handle is currently registered.
+    pub fn bytes(&self) -> u64 {
+        self.bytes.get()
+    }
+
+    /// Whether a GPU handle is currently cached for this bitmap.
+    pub fn has_gpu_handle(&self) -> bool {
+        self.handle.borrow().is_some()
     }
 }
 
