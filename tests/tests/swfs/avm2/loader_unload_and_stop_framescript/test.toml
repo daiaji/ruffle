@@ -1,0 +1,19 @@
+# `Loader.unloadAndStop()` called from the frame-script phase (what the game
+# does - `ブラックアウト_21.frame21`), unlike the `loader_unload_and_stop_ticks`
+# probe which calls it from an enterFrame handler. `output.txt` is recorded
+# from a real Flash projector (jplt.exe).
+num_ticks = 75
+
+[[compilers]]
+type = "Asc"
+target = "test.swf"
+class = "ProbeFS"
+scripts = ["ProbeFS.as"]
+swf_version = 41
+
+[[compilers]]
+type = "Asc"
+target = "child2.swf"
+class = "TickChild"
+scripts = ["TickChild.as"]
+swf_version = 41

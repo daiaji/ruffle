@@ -1,0 +1,10 @@
+--- unloadAndStop() from the frame-script phase ---
+child enterFrame listener before = true
+child enterFrame listener after  = true
+--- window 1: the 37 frames after the unload ---
+ticks the unloaded movie got     = 0
+enterFrame listener after        = true
+--- window 2: 20 frames much later ---
+ticks the unloaded movie got     = 0
+PROBE_DONE
+PROBE_SOL_WRITTEN
