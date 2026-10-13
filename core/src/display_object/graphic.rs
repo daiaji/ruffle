@@ -18,7 +18,7 @@ use gc_arena::{Collect, Gc, Mutation};
 use ruffle_common::utils::HasPrefixField;
 use ruffle_render::backend::ShapeHandle;
 use ruffle_render::commands::CommandHandler;
-use std::cell::{OnceCell, RefCell, RefMut};
+use std::cell::{Cell, OnceCell, RefCell, RefMut};
 
 #[derive(Clone, Collect, Copy)]
 #[collect(no_drop)]
@@ -59,6 +59,7 @@ impl<'gc> Graphic<'gc> {
             shape: swf_shape,
             movie,
             scaled_handle: RefCell::new(TessellationCache::new()),
+            last_used: Cell::new(crate::library::texture_clock()),
         };
 
         Graphic(Gc::new(
@@ -93,6 +94,7 @@ impl<'gc> Graphic<'gc> {
             },
             movie: *context.root_swf,
             scaled_handle: RefCell::new(TessellationCache::new()),
+            last_used: Cell::new(crate::library::texture_clock()),
         };
 
         Graphic(Gc::new(
@@ -123,6 +125,19 @@ impl<'gc> Graphic<'gc> {
         unlock!(Gc::write(mc, self.0), GraphicData, shared).set(shared);
     }
 
+    /// Drops cached GPU resources (the tessellated shape meshes) for this
+    /// character. The underlying shape data is kept, so meshes are lazily
+    /// re-created if this character is rendered again.
+    pub(crate) fn release_gpu_resources(self) {
+        let shared = self.0.shared.get();
+        *shared.scaled_handle.borrow_mut() = TessellationCache::new();
+    }
+
+    /// The texture-clock tick at which this graphic's mesh was last rendered.
+    pub(crate) fn last_used(self) -> u64 {
+        self.0.shared.get().last_used.get()
+    }
+
     /// Returns the best shape handle for the current scale, tessellating if necessary.
     ///
     /// Shapes are not tessellated when they are defined: the first draw tessellates
@@ -135,6 +150,7 @@ impl<'gc> Graphic<'gc> {
         // Since graphics are created from a shared shape, we may be able to reuse a
         // cached tessellation from another instance at a similar scale.
         let shared = self.0.shared.get();
+        shared.last_used.set(crate::library::texture_clock());
 
         {
             let mut cache = shared.scaled_handle.borrow_mut();
@@ -343,4 +359,9 @@ struct GraphicShared<'gc> {
 
     #[collect(require_static)]
     scaled_handle: RefCell<TessellationCache>,
+
+    /// The texture-clock tick at which this graphic's mesh was last rendered,
+    /// used by the GPU resource sweeper to evict stale meshes.
+    #[collect(require_static)]
+    last_used: Cell<u64>,
 }

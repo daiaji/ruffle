@@ -13,7 +13,7 @@ use gc_arena::{Collect, Gc, Mutation};
 use ruffle_common::utils::HasPrefixField;
 use ruffle_render::backend::ShapeHandle;
 use ruffle_render::commands::CommandHandler;
-use std::cell::{RefCell, RefMut};
+use std::cell::{Cell, RefCell, RefMut};
 use swf::{Fixed8, Fixed16};
 
 #[derive(Clone, Collect, Copy)]
@@ -57,6 +57,18 @@ impl<'gc> MorphShape<'gc> {
 
     pub fn instantiate(self, gc_context: &Mutation<'gc>) -> Self {
         Self(Gc::new(gc_context, (*self.0).clone()))
+    }
+
+    /// Drops cached GPU resources (tessellated morph frames) for this
+    /// character. Frames are lazily rebuilt if this character is rendered
+    /// again.
+    pub(crate) fn release_gpu_resources(self) {
+        self.0.shared.get().frames.borrow_mut().clear();
+    }
+
+    /// The texture-clock tick at which this morph shape was last rendered.
+    pub(crate) fn last_used(self) -> u64 {
+        self.0.shared.get().last_used.get()
     }
 }
 
@@ -205,6 +217,11 @@ pub struct MorphShapeShared<'gc> {
 
     #[collect(require_static)]
     frames: RefCell<fnv::FnvHashMap<u16, Frame>>,
+
+    /// The texture-clock tick at which this morph shape was last rendered,
+    /// used by the GPU resource sweeper to evict stale morph frames.
+    #[collect(require_static)]
+    last_used: Cell<u64>,
 }
 
 impl<'gc> MorphShapeShared<'gc> {
@@ -214,6 +231,7 @@ impl<'gc> MorphShapeShared<'gc> {
             start: swf_tag.start.clone(),
             end: swf_tag.end.clone(),
             frames: RefCell::new(fnv::FnvHashMap::default()),
+            last_used: Cell::new(crate::library::texture_clock()),
             movie,
         }
     }
@@ -232,6 +250,7 @@ impl<'gc> MorphShapeShared<'gc> {
     /// Retrieves the `ShapeHandle` for the given ratio.
     /// Lazily initializes and tessellates the shape if it does not yet exist.
     fn get_shape(&self, context: &mut RenderContext<'_, 'gc>, ratio: u16) -> ShapeHandle {
+        self.last_used.set(crate::library::texture_clock());
         let mut frame = self.get_frame(ratio);
         if let Some(handle) = frame.shape_handle.clone() {
             handle

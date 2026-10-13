@@ -25,6 +25,16 @@ pub struct BitmapCacheEntry {
     pub filters: Vec<Filter>,
 }
 
+/// A snapshot of GPU memory usage reported by a render backend.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct GpuMemoryUsage {
+    /// Sum of the memory reserved by all GPU memory blocks, including regions
+    /// that are not currently allocated to a resource.
+    pub reserved_bytes: u64,
+    /// Sum of the memory used by live GPU allocations.
+    pub allocated_bytes: u64,
+}
+
 pub trait RenderBackend: Any {
     fn viewport_dimensions(&self) -> ViewportDimensions;
     // Do not call this method directly - use `player.set_viewport_dimensions`,
@@ -106,6 +116,15 @@ pub trait RenderBackend: Any {
     fn debug_info(&self) -> Cow<'static, str>;
     /// An internal name that is used to identify the render-backend.
     fn name(&self) -> &'static str;
+
+    /// A reading of the GPU memory currently held by this backend, if the
+    /// backend is able to report it.
+    ///
+    /// Backends that cannot report usage return `None`, and callers must fall
+    /// back to their own accounting.
+    fn gpu_memory_usage(&self) -> Option<GpuMemoryUsage> {
+        None
+    }
 
     fn set_quality(&mut self, quality: StageQuality);
 

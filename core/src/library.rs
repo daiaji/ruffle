@@ -18,6 +18,119 @@ use crate::backend::ui::{FontDefinition, UiBackend};
 use crate::font::DefaultFont;
 use fnv::{FnvHashMap, FnvHashSet};
 use std::collections::HashMap;
+use std::sync::OnceLock;
+use std::sync::atomic::{AtomicU64, Ordering};
+
+/// A monotonically increasing per-frame tick used to track how long GPU
+/// resources (bitmap textures, tessellated meshes) have gone unused.
+pub(crate) static TEXTURE_CLOCK: AtomicU64 = AtomicU64::new(0);
+
+/// The texture-clock tick, for stamping GPU resource creation and use.
+pub(crate) fn texture_clock() -> u64 {
+    TEXTURE_CLOCK.load(Ordering::Relaxed)
+}
+
+/// How often (in frames) the GPU resource sweeper runs.
+const GPU_SWEEP_INTERVAL: u64 = 1200;
+
+/// GPU resources whose create/use stamp is older than this many frames get
+/// evicted; they are lazily re-created if they are ever needed again.
+const GPU_SWEEP_MAX_AGE: u64 = GPU_SWEEP_INTERVAL;
+
+/// The default soft budget for GPU memory, used when the
+/// `RUFFLE_GPU_TEXTURE_BUDGET_MB` environment variable is not set.
+const DEFAULT_GPU_TEXTURE_BUDGET_BYTES: u64 = 2 * 1024 * 1024 * 1024;
+
+/// The soft GPU memory budget, in bytes.
+///
+/// When reported (or accounted) GPU memory exceeds this, the oldest bitmap
+/// textures are evicted even if they are not yet stale, so that bursts of
+/// uploads (e.g. the first rendered frame of a bitmap-heavy scene) cannot
+/// exhaust VRAM.
+///
+/// May be overridden with the `RUFFLE_GPU_TEXTURE_BUDGET_MB` environment
+/// variable.
+fn gpu_texture_budget_bytes() -> u64 {
+    static BUDGET: OnceLock<u64> = OnceLock::new();
+    *BUDGET.get_or_init(|| {
+        std::env::var("RUFFLE_GPU_TEXTURE_BUDGET_MB")
+            .ok()
+            .and_then(|value| parse_gpu_budget_mb(&value))
+            .unwrap_or(DEFAULT_GPU_TEXTURE_BUDGET_BYTES)
+    })
+}
+
+/// Parses a `RUFFLE_GPU_TEXTURE_BUDGET_MB` value (whole megabytes) into bytes.
+///
+/// Invalid or zero values are rejected, so the caller falls back to the
+/// default budget.
+fn parse_gpu_budget_mb(value: &str) -> Option<u64> {
+    value
+        .trim()
+        .parse::<u64>()
+        .ok()
+        .map(|megabytes| megabytes.saturating_mul(1024 * 1024))
+        .filter(|bytes| *bytes > 0)
+}
+
+/// Chooses which live textures to evict so that at least `excess` bytes are
+/// released, least recently used first. `live` holds `(last_used_tick, bytes)` for each
+/// candidate; the returned indices are in eviction order.
+fn eviction_plan(live: &[(u64, u64)], excess: u64) -> Vec<usize> {
+    let mut plan = Vec::new();
+    if excess == 0 {
+        return plan;
+    }
+    let mut order: Vec<usize> = (0..live.len()).collect();
+    order.sort_by_key(|index| live[*index].0);
+    let mut remaining = excess;
+    for index in order {
+        if remaining == 0 {
+            break;
+        }
+        remaining = remaining.saturating_sub(live[index].1);
+        plan.push(index);
+    }
+    plan
+}
+
+/// Running account of GPU texture bytes held by bitmap characters, updated on
+/// handle creation and release.
+///
+/// This is used as a fallback when the render backend cannot report its own
+/// GPU memory usage; it only counts textures uploaded for library bitmap
+/// characters, not meshes, render targets, or `BitmapData` textures.
+static GPU_TEXTURE_BYTES: AtomicU64 = AtomicU64::new(0);
+
+/// Records that `bytes` of GPU texture memory were uploaded.
+pub(crate) fn add_gpu_texture_bytes(bytes: u64) {
+    GPU_TEXTURE_BYTES.fetch_add(bytes, Ordering::Relaxed);
+}
+
+/// Records that `bytes` of GPU texture memory were released.
+pub(crate) fn subtract_gpu_texture_bytes(bytes: u64) {
+    GPU_TEXTURE_BYTES.fetch_sub(bytes, Ordering::Relaxed);
+}
+
+/// Re-baselines the account to the bytes actually held by live handles.
+///
+/// A handle dropped without an explicit release - a bitmap character collected
+/// by the GC, say - frees its texture without subtracting itself, so the running
+/// total would drift upward over a long session. Every sweep re-baselines it to
+/// what the live handles actually hold.
+fn reconcile_gpu_texture_bytes(bytes: u64) {
+    GPU_TEXTURE_BYTES.store(bytes, Ordering::Relaxed);
+}
+
+/// An estimate of the GPU texture memory currently held by bitmap characters,
+/// in bytes.
+///
+/// This only counts textures uploaded for library bitmap characters; it does
+/// not include tessellated meshes, render targets, or textures owned by
+/// `BitmapData` objects. It is intended for diagnostics (e.g. crash reports).
+pub fn estimated_gpu_texture_bytes() -> u64 {
+    GPU_TEXTURE_BYTES.load(Ordering::Relaxed)
+}
 
 #[derive(Clone, Collect)]
 #[collect(no_drop)]
@@ -112,6 +225,30 @@ impl<'gc> MovieLibrary<'gc> {
             jpeg_tables: None,
             fonts: Default::default(),
             avm2_domain: None,
+        }
+    }
+
+    /// Frees cached GPU-side resources (uploaded bitmap textures and
+    /// tessellated shape meshes) for every character in this library.
+    ///
+    /// The underlying character data is kept, so anything that still renders
+    /// this movie's characters lazily re-creates the GPU resources on demand.
+    /// This is called when a movie is discarded (e.g. `Loader.unload()`), so
+    /// that repeated load/unload cycles don't accumulate GPU memory.
+    pub fn release_gpu_resources(&mut self) {
+        for character in self.characters.values_mut() {
+            match *character {
+                Character::Bitmap(bitmap) => {
+                    bitmap.release_gpu_handle();
+                }
+                Character::Graphic(graphic) => {
+                    graphic.release_gpu_resources();
+                }
+                Character::MorphShape(morph) => {
+                    morph.release_gpu_resources();
+                }
+                _ => {}
+            }
         }
     }
 
@@ -454,6 +591,107 @@ impl<'gc> Library<'gc> {
 
     pub fn known_movies(&self) -> impl Iterator<Item = SwfMovie<'gc>> {
         self.movie_libraries.known_movies()
+    }
+
+    /// Called once per player frame. Advances the texture clock, and
+    /// periodically sweeps all movie libraries for GPU resources (uploaded
+    /// bitmap textures, tessellated meshes) that haven't been used in
+    /// `GPU_SWEEP_MAX_AGE` frames, releasing them to bound VRAM usage.
+    ///
+    /// In addition to the age-based eviction, the sweep enforces a soft memory
+    /// budget: if the render backend reports a GPU memory reading (Vulkan and
+    /// DX12 can), that real value is used; otherwise we fall back to our own
+    /// accounting of bitmap textures. When over budget, the oldest textures
+    /// are evicted first.
+    ///
+    /// Evicted resources are lazily re-created on demand, so nothing breaks;
+    /// frequently rendered resources keep their stamps fresh and are never
+    /// evicted.
+    pub fn tick_gpu_resources(&mut self, renderer: &dyn RenderBackend) {
+        let now = TEXTURE_CLOCK.fetch_add(1, Ordering::Relaxed) + 1;
+
+        if !now.is_multiple_of(GPU_SWEEP_INTERVAL) {
+            return;
+        }
+        let cutoff = now.saturating_sub(GPU_SWEEP_MAX_AGE);
+
+        // A single pass over every character: evict stale textures and meshes,
+        // and collect the surviving textures (least recently used first) so the byte budget
+        // can be enforced below.
+        let mut live: Vec<(u64, u64, SwfMovie<'gc>, CharacterId)> = Vec::new();
+        for movie in self.movie_libraries.known_movies() {
+            let Some(library) = self.movie_libraries.get(movie) else {
+                continue;
+            };
+            for (id, character) in library.characters.iter() {
+                match *character {
+                    Character::Bitmap(bitmap) => {
+                        if !bitmap.has_gpu_handle() {
+                            continue;
+                        }
+                        if bitmap.last_used() < cutoff {
+                            bitmap.release_gpu_handle();
+                        } else {
+                            live.push((bitmap.last_used(), bitmap.bytes(), movie, *id));
+                        }
+                    }
+                    // Only release meshes that haven't been rendered since
+                    // the cutoff; rendering refreshes `last_used`.
+                    Character::Graphic(graphic) if graphic.last_used() < cutoff => {
+                        graphic.release_gpu_resources();
+                    }
+                    Character::MorphShape(morph) if morph.last_used() < cutoff => {
+                        morph.release_gpu_resources();
+                    }
+                    _ => {}
+                }
+            }
+        }
+
+        // Re-baseline the account now that we know which bitmaps still hold a
+        // handle, discarding any drift from handles released without an
+        // explicit release (and therefore never subtracted).
+        reconcile_gpu_texture_bytes(live.iter().map(|(_, bytes, ..)| *bytes).sum());
+
+        // Prefer a real reading of GPU memory from the backend; fall back to
+        // our own accounting when the backend cannot report usage (e.g. GL).
+        //
+        // Budget against the *allocated* bytes (live GPU allocations), not the
+        // reserved bytes: a suballocating backend keeps the memory blocks of
+        // freed allocations around, so `reserved_bytes` would not fall as we
+        // evict, and every sweep would evict everything.
+        let backend_usage = renderer.gpu_memory_usage();
+        let pressure = backend_usage
+            .map(|usage| usage.allocated_bytes)
+            .unwrap_or_else(estimated_gpu_texture_bytes);
+        let budget = gpu_texture_budget_bytes();
+
+        if pressure > budget {
+            let candidates: Vec<(u64, u64)> = live
+                .iter()
+                .map(|(created, bytes, ..)| (*created, *bytes))
+                .collect();
+            for index in eviction_plan(&candidates, pressure - budget) {
+                let (_, _, movie, id) = live[index];
+                let Some(library) = self.movie_libraries.get(movie) else {
+                    continue;
+                };
+                if let Some(Character::Bitmap(bitmap)) = library.characters.get(&id)
+                    && bitmap.has_gpu_handle()
+                {
+                    bitmap.release_gpu_handle();
+                }
+            }
+        }
+
+        tracing::debug!(
+            "GPU resource sweep: backend allocated={:?} MB reserved={:?} MB, own estimate={} MB, {} live bitmap textures, budget {} MB",
+            backend_usage.map(|usage| usage.allocated_bytes / (1024 * 1024)),
+            backend_usage.map(|usage| usage.reserved_bytes / (1024 * 1024)),
+            estimated_gpu_texture_bytes() / (1024 * 1024),
+            live.len(),
+            budget / (1024 * 1024),
+        );
     }
 
     /// Returns the default Font implementations behind the built in names (ie `_sans`)
@@ -829,5 +1067,313 @@ impl<'gc> FontMap<'gc> {
 
     pub fn iter_all(&self) -> impl Iterator<Item = Font<'gc>> {
         self.0.values().copied()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        GPU_SWEEP_INTERVAL, GPU_SWEEP_MAX_AGE, Library, TEXTURE_CLOCK, add_gpu_texture_bytes,
+        estimated_gpu_texture_bytes, eviction_plan, parse_gpu_budget_mb, texture_clock,
+    };
+    use crate::character::{BitmapCharacter, Character, CompressedBitmap};
+    use crate::tag_utils::{SwfMovie, SwfMovieData};
+    use gc_arena::lock::GcRefLock;
+    use gc_arena::{Collect, Gc, Rootable};
+    use ruffle_render::backend::ViewportDimensions;
+    use ruffle_render::backend::null::NullRenderer;
+    use std::borrow::Cow;
+    use std::io::Write;
+    use std::sync::Mutex;
+    use std::sync::atomic::Ordering;
+
+    /// The GPU accounting statics are process-wide, so the tests that assert on
+    /// them must not run concurrently with each other.
+    static TEST_LOCK: Mutex<()> = Mutex::new(());
+
+    type GpuTestArena = gc_arena::Arena<Rootable![GpuTestRoot<'_>]>;
+
+    #[derive(Collect)]
+    #[collect(no_drop)]
+    struct GpuTestRoot<'gc> {
+        data: GcRefLock<'gc, GpuTestData<'gc>>,
+    }
+
+    #[derive(Collect)]
+    #[collect(no_drop)]
+    struct GpuTestData<'gc> {
+        library: Library<'gc>,
+        movie: SwfMovie<'gc>,
+    }
+
+    /// A 4x4 RGBA32 bitmap tag, fully self-contained: zlib-compressed Rgb32
+    /// rows (straight BGRA quads; the decoder swizzles them to RGBA).
+    fn test_bitmap() -> CompressedBitmap {
+        let mut pixels = Vec::with_capacity(4 * 4 * 4);
+        for _ in 0..4 * 4 {
+            pixels.extend([0x10, 0x20, 0x30, 0xFF]);
+        }
+        let mut encoder =
+            flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::default());
+        encoder.write_all(&pixels).unwrap();
+        CompressedBitmap::Lossless(swf::DefineBitsLossless {
+            version: 2,
+            id: 1,
+            format: swf::BitmapFormat::Rgb32,
+            width: 4,
+            height: 4,
+            data: Cow::Owned(encoder.finish().unwrap()),
+        })
+    }
+
+    fn null_renderer() -> NullRenderer {
+        NullRenderer::new(ViewportDimensions {
+            width: 64,
+            height: 64,
+            scale_factor: 1.0,
+        })
+    }
+
+    #[test]
+    fn gpu_accounting_balances_through_bitmap_character() {
+        let _guard = TEST_LOCK.lock().unwrap();
+        let baseline = estimated_gpu_texture_bytes();
+        let bitmap = BitmapCharacter::new(test_bitmap());
+        let mut renderer = null_renderer();
+
+        // Requesting the handle uploads the texture and counts its bytes.
+        let _handle = bitmap.bitmap_handle(&mut renderer).unwrap();
+        assert_eq!(estimated_gpu_texture_bytes() - baseline, 4 * 4 * 4);
+        assert!(bitmap.has_gpu_handle());
+
+        // Releasing drops the handle and un-counts the bytes.
+        bitmap.release_gpu_handle();
+        assert_eq!(estimated_gpu_texture_bytes(), baseline);
+        assert!(!bitmap.has_gpu_handle());
+
+        // Re-requesting lazily re-creates the handle and re-counts.
+        let _handle = bitmap.bitmap_handle(&mut renderer).unwrap();
+        assert_eq!(estimated_gpu_texture_bytes() - baseline, 4 * 4 * 4);
+
+        // Leave the accounting where we found it (there is no Drop that
+        // un-counts, so an unreleased handle would leak into later tests).
+        bitmap.release_gpu_handle();
+        assert_eq!(estimated_gpu_texture_bytes(), baseline);
+    }
+
+    #[test]
+    fn release_gpu_resources_zeroes_accounting() {
+        let _guard = TEST_LOCK.lock().unwrap();
+        let baseline = estimated_gpu_texture_bytes();
+        let arena: GpuTestArena = gc_arena::Arena::new(|gc| GpuTestRoot {
+            data: GcRefLock::new(
+                gc,
+                GpuTestData {
+                    library: Library::empty(),
+                    movie: SwfMovie::new(gc, SwfMovieData::empty(41, None)),
+                }
+                .into(),
+            ),
+        });
+        arena.mutate(|mc, root| {
+            let bitmap = Gc::new(mc, BitmapCharacter::new(test_bitmap()));
+            let mut data = root.data.borrow_mut(mc);
+            let movie = data.movie;
+            data.library
+                .library_for_movie_mut(movie)
+                .register_character(1, Character::Bitmap(bitmap));
+            let mut renderer = null_renderer();
+            let _ = bitmap.bitmap_handle(&mut renderer).unwrap();
+            assert_eq!(estimated_gpu_texture_bytes() - baseline, 4 * 4 * 4);
+
+            // Releasing the movie's GPU resources (the unload path) drops the
+            // handle and un-counts its bytes; the character data is kept.
+            data.library
+                .library_for_movie_mut(movie)
+                .release_gpu_resources();
+            assert_eq!(estimated_gpu_texture_bytes(), baseline);
+            assert!(!bitmap.has_gpu_handle());
+        });
+    }
+
+    #[test]
+    fn tick_gpu_resources_evicts_unused_bitmaps() {
+        let _guard = TEST_LOCK.lock().unwrap();
+        let baseline = estimated_gpu_texture_bytes();
+        let arena: GpuTestArena = gc_arena::Arena::new(|gc| GpuTestRoot {
+            data: GcRefLock::new(
+                gc,
+                GpuTestData {
+                    library: Library::empty(),
+                    movie: SwfMovie::new(gc, SwfMovieData::empty(41, None)),
+                }
+                .into(),
+            ),
+        });
+        arena.mutate(|mc, root| {
+            let bitmap = Gc::new(mc, BitmapCharacter::new(test_bitmap()));
+            let mut data = root.data.borrow_mut(mc);
+            let movie = data.movie;
+            data.library
+                .library_for_movie_mut(movie)
+                .register_character(1, Character::Bitmap(bitmap));
+            let mut renderer = null_renderer();
+            let _ = bitmap.bitmap_handle(&mut renderer).unwrap();
+            assert_eq!(estimated_gpu_texture_bytes() - baseline, 4 * 4 * 4);
+
+            // Land the next tick on the *second* sweep boundary after the
+            // upload, so the bitmap's stamp is older than the cutoff: the
+            // sweep evicts it.
+            let stamp = texture_clock();
+            let first_boundary = ((stamp / GPU_SWEEP_INTERVAL) + 1) * GPU_SWEEP_INTERVAL;
+            TEXTURE_CLOCK.store(first_boundary + GPU_SWEEP_MAX_AGE - 1, Ordering::Relaxed);
+            data.library.tick_gpu_resources(&renderer);
+
+            assert_eq!(estimated_gpu_texture_bytes(), baseline);
+            assert!(!bitmap.has_gpu_handle());
+
+            // The evicted texture is re-created lazily on the next request,
+            // and releasing it again leaves the accounting where we found it.
+            let _ = bitmap.bitmap_handle(&mut renderer).unwrap();
+            assert_eq!(estimated_gpu_texture_bytes() - baseline, 4 * 4 * 4);
+            bitmap.release_gpu_handle();
+            assert_eq!(estimated_gpu_texture_bytes(), baseline);
+        });
+    }
+
+    #[test]
+    fn tick_gpu_resources_keeps_fresh_bitmaps() {
+        let _guard = TEST_LOCK.lock().unwrap();
+        let baseline = estimated_gpu_texture_bytes();
+        let arena: GpuTestArena = gc_arena::Arena::new(|gc| GpuTestRoot {
+            data: GcRefLock::new(
+                gc,
+                GpuTestData {
+                    library: Library::empty(),
+                    movie: SwfMovie::new(gc, SwfMovieData::empty(41, None)),
+                }
+                .into(),
+            ),
+        });
+        arena.mutate(|mc, root| {
+            let bitmap = Gc::new(mc, BitmapCharacter::new(test_bitmap()));
+            let mut data = root.data.borrow_mut(mc);
+            let movie = data.movie;
+            data.library
+                .library_for_movie_mut(movie)
+                .register_character(1, Character::Bitmap(bitmap));
+            let mut renderer = null_renderer();
+            let _ = bitmap.bitmap_handle(&mut renderer).unwrap();
+            let stamp = texture_clock();
+
+            // Land the next tick on the *first* sweep boundary after the
+            // upload, so the bitmap's stamp stays inside the max-age window:
+            // the sweep runs but does not evict it.
+            let first_boundary = ((stamp / GPU_SWEEP_INTERVAL) + 1) * GPU_SWEEP_INTERVAL;
+            TEXTURE_CLOCK.store(first_boundary - 1, Ordering::Relaxed);
+            data.library.tick_gpu_resources(&renderer);
+
+            assert_eq!(estimated_gpu_texture_bytes() - baseline, 4 * 4 * 4);
+            assert!(bitmap.has_gpu_handle());
+
+            bitmap.release_gpu_handle();
+            assert_eq!(estimated_gpu_texture_bytes(), baseline);
+        });
+    }
+
+    #[test]
+    fn tick_gpu_resources_rebaselines_drifted_accounting() {
+        let _guard = TEST_LOCK.lock().unwrap();
+        let baseline = estimated_gpu_texture_bytes();
+        let arena: GpuTestArena = gc_arena::Arena::new(|gc| GpuTestRoot {
+            data: GcRefLock::new(
+                gc,
+                GpuTestData {
+                    library: Library::empty(),
+                    movie: SwfMovie::new(gc, SwfMovieData::empty(41, None)),
+                }
+                .into(),
+            ),
+        });
+        arena.mutate(|mc, root| {
+            let bitmap = Gc::new(mc, BitmapCharacter::new(test_bitmap()));
+            let mut data = root.data.borrow_mut(mc);
+            let movie = data.movie;
+            data.library
+                .library_for_movie_mut(movie)
+                .register_character(1, Character::Bitmap(bitmap));
+            let mut renderer = null_renderer();
+            let _ = bitmap.bitmap_handle(&mut renderer).unwrap();
+
+            // Simulate a handle dropped without an explicit release (a
+            // character collected by the GC): the account now over-reports.
+            add_gpu_texture_bytes(1024 * 1024);
+            assert_eq!(
+                estimated_gpu_texture_bytes() - baseline,
+                4 * 4 * 4 + 1024 * 1024
+            );
+
+            // The sweep re-baselines the account to the live handles, so the
+            // stale surplus disappears even though this bitmap survives it.
+            let stamp = texture_clock();
+            let first_boundary = ((stamp / GPU_SWEEP_INTERVAL) + 1) * GPU_SWEEP_INTERVAL;
+            TEXTURE_CLOCK.store(first_boundary - 1, Ordering::Relaxed);
+            data.library.tick_gpu_resources(&renderer);
+
+            assert_eq!(estimated_gpu_texture_bytes() - baseline, 4 * 4 * 4);
+            assert!(bitmap.has_gpu_handle());
+
+            bitmap.release_gpu_handle();
+            assert_eq!(estimated_gpu_texture_bytes(), baseline);
+        });
+    }
+
+    #[test]
+    fn parse_gpu_budget_mb_accepts_positive_values() {
+        assert_eq!(parse_gpu_budget_mb("512"), Some(512 * 1024 * 1024));
+        assert_eq!(parse_gpu_budget_mb(" 1024 "), Some(1024 * 1024 * 1024));
+        // Extremely large values saturate rather than overflowing.
+        assert_eq!(parse_gpu_budget_mb("18446744073709551615"), Some(u64::MAX));
+    }
+
+    #[test]
+    fn parse_gpu_budget_mb_rejects_invalid_values() {
+        assert_eq!(parse_gpu_budget_mb(""), None);
+        assert_eq!(parse_gpu_budget_mb("0"), None);
+        assert_eq!(parse_gpu_budget_mb("abc"), None);
+        assert_eq!(parse_gpu_budget_mb("-100"), None);
+    }
+
+    #[test]
+    fn eviction_plan_is_empty_without_pressure() {
+        assert!(eviction_plan(&[(1, 100), (2, 100)], 0).is_empty());
+    }
+
+    #[test]
+    fn eviction_plan_evicts_least_recently_used_first() {
+        let live = [(10, 100), (20, 100), (30, 100)];
+        assert_eq!(eviction_plan(&live, 100), vec![0]);
+        assert_eq!(eviction_plan(&live, 150), vec![0, 1]);
+    }
+
+    #[test]
+    fn eviction_plan_handles_unsorted_live_textures() {
+        let live = [(30, 50), (10, 50), (20, 50)];
+        // Newest entry is first in the list, oldest is in the middle.
+        assert_eq!(eviction_plan(&live, 50), vec![1]);
+        assert_eq!(eviction_plan(&live, 150), vec![1, 2, 0]);
+    }
+
+    #[test]
+    fn eviction_plan_evicts_everything_when_pressure_exceeds_total() {
+        let live = [(10, 40), (20, 40)];
+        assert_eq!(eviction_plan(&live, 1000), vec![0, 1]);
+    }
+
+    #[test]
+    fn eviction_plan_accounts_for_zero_byte_entries() {
+        // A texture that reports no size frees nothing, so eviction continues.
+        let live = [(1, 0), (2, 100)];
+        assert_eq!(eviction_plan(&live, 100), vec![0, 1]);
     }
 }

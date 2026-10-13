@@ -291,7 +291,20 @@ impl<'gc> LoaderInfoObject<'gc> {
 
         // Remove the Loader's content element if it exists.
         if let Some(child) = content {
+            let unloaded_movie = child.movie();
             loader.remove_child(context, child);
+            // The movie is being discarded: release the GPU-side resources
+            // (uploaded bitmap textures, tessellated meshes) cached for its
+            // characters. Without this, GPU memory would grow with every
+            // load/unload cycle. The character data itself is kept, so
+            // anything still referencing this movie lazily re-creates the
+            // resources on demand.
+            if !SwfMovie::ptr_eq(&unloaded_movie, context.root_swf) {
+                context
+                    .library
+                    .library_for_movie_mut(unloaded_movie)
+                    .release_gpu_resources();
+            }
         }
     }
 }

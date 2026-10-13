@@ -15,7 +15,8 @@ use crate::{
 };
 use image::imageops::FilterType;
 use ruffle_render::backend::{
-    BitmapCacheEntry, Context3D, Context3DProfile, PixelBenderOutput, PixelBenderTarget,
+    BitmapCacheEntry, Context3D, Context3DProfile, GpuMemoryUsage, PixelBenderOutput,
+    PixelBenderTarget,
 };
 use ruffle_render::backend::{RenderBackend, ShapeHandle, ViewportDimensions};
 use ruffle_render::bitmap::{
@@ -463,6 +464,18 @@ impl<T: RenderTarget + 'static> RenderBackend for WgpuRenderBackend<T> {
             self.descriptors.clone(),
             profile,
         )))
+    }
+
+    fn gpu_memory_usage(&self) -> Option<GpuMemoryUsage> {
+        // wgpu exposes gpu-allocator's statistics on the Vulkan and DX12
+        // backends; other backends return `None`.
+        self.descriptors
+            .device
+            .generate_allocator_report()
+            .map(|report| GpuMemoryUsage {
+                reserved_bytes: report.total_reserved_bytes,
+                allocated_bytes: report.total_allocated_bytes,
+            })
     }
 
     fn debug_info(&self) -> Cow<'static, str> {
