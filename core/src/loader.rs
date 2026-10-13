@@ -39,7 +39,7 @@ use crate::tag_utils::{SwfMovie, SwfMovieData};
 use crate::vminterface::Instantiator;
 use chardetng::EncodingDetector;
 use encoding_rs::{UTF_8, WINDOWS_1252};
-use gc_arena::Collect;
+use gc_arena::{Collect, Gc};
 use indexmap::IndexMap;
 use ruffle_common::tag_utils::LoadBytesInfo;
 use ruffle_macros::istr;
@@ -259,6 +259,67 @@ impl<'gc> LoadManager<'gc> {
         self.0.get_mut(handle)
     }
 
+    /// Cancels the in-flight AVM2 load for the given `LoaderInfo`, if one is
+    /// in progress. This is what `Loader.close()` calls.
+    ///
+    /// A closed load is discarded at every later milestone: no `open`,
+    /// `progress`, `init`, `complete` or `ioError` events fire, and no
+    /// content is ever attached. This is per-load state, so a subsequent
+    /// `load()` on the same loader is unaffected.
+    pub fn cancel_avm2_load(&mut self, loader_info: LoaderInfoObject<'gc>) -> CancelAvm2Load {
+        let mut result = CancelAvm2Load::NotFound;
+        for (_, loader) in self.0.iter_mut() {
+            if let MovieLoaderVMData::Avm2 {
+                loader_info: li, ..
+            } = loader.vm_data
+                && Gc::ptr_eq(li.0, loader_info.0)
+            {
+                // `loadBytes` delivers its data synchronously, so there is
+                // never a `load()` in progress to close (unmeasured against
+                // Flash, but this matches the documented contract of
+                // `close()` cancelling a `load()` operation).
+                if loader.vm_data.load_bytes_info().is_some()
+                    || loader.load_cancelled
+                    || matches!(
+                        loader.loader_status,
+                        LoaderStatus::Succeeded | LoaderStatus::Failed
+                    )
+                {
+                    // There is a load registered for this LoaderInfo, but it
+                    // isn't running anymore - `close()` on real Flash throws
+                    // IOError #2029 in this case.
+                    result = CancelAvm2Load::NotInProgress;
+                } else {
+                    loader.load_cancelled = true;
+                    result = CancelAvm2Load::Cancelled;
+                }
+            }
+        }
+        result
+    }
+
+    /// Checks if the load on the given handle was cancelled via
+    /// `Loader.close()`. If so, it will set the `loader_status` to `Failed`
+    /// and return `true`.
+    ///
+    /// (see the avm2/loader_close test)
+    pub fn load_cancelled_avm2(&mut self, handle: LoaderHandle) -> bool {
+        match self.get_loader_mut(handle) {
+            Some(MovieLoader {
+                load_cancelled,
+                loader_status,
+                ..
+            }) => {
+                if *load_cancelled {
+                    *loader_status = LoaderStatus::Failed;
+                    return true;
+                }
+            }
+            _ => unreachable!(),
+        }
+        false
+    }
+
     /// Checks if the target clip on the given handle's loader
     /// has been `avm1_removed()`. If so, it will set the `loader_status`
     /// to `Failed` and return `true`.
@@ -320,6 +381,7 @@ impl<'gc> LoadManager<'gc> {
             vm_data,
             loader_status: LoaderStatus::Pending,
             movie: None,
+            load_cancelled: false,
         };
         let handle = self.add_loader(loader);
         let loader = self.get_loader_mut(handle).unwrap();
@@ -412,6 +474,7 @@ impl<'gc> LoadManager<'gc> {
             vm_data,
             loader_status: LoaderStatus::Pending,
             movie: None,
+            load_cancelled: false,
         };
         let handle = context.load_manager.add_loader(loader);
         MovieLoader::movie_loader_bytes(handle, context, loader_url, bytes)
@@ -456,6 +519,10 @@ impl<'gc> LoadManager<'gc> {
         let handles: Vec<_> = context.load_manager.0.iter().map(|(h, _)| h).collect();
 
         for handle in handles {
+            if context.load_manager.load_cancelled_avm2(handle) {
+                // This load was closed via `Loader.close()`: stop parsing it.
+                continue;
+            }
             let status = match context.load_manager.get_loader(handle) {
                 Some(MovieLoader { loader_status, .. }) => Some(loader_status),
                 _ => None,
@@ -484,6 +551,12 @@ impl<'gc> LoadManager<'gc> {
         }
         let handles: Vec<_> = context.load_manager.0.iter().map(|(h, _)| h).collect();
         for handle in handles {
+            if context.load_manager.load_cancelled_avm2(handle) {
+                // This load was closed via `Loader.close()`: no further
+                // events fire for it. It gets reaped by `movie_clip_on_load`
+                // (its status is now `Failed`).
+                continue;
+            }
             if let Some(MovieLoader { target_clip, .. }) = context.load_manager.get_loader(handle)
                 && let Some(movie) = target_clip.as_movie_clip()
                 && movie.try_fire_loaderinfo_events(context)
@@ -513,6 +586,18 @@ async fn wait_for_full_response(
         Ok(body) => Ok((body, url, status, redirected)),
         Err(error) => Err(ErrorResponse { url, error }),
     }
+}
+
+/// The outcome of an attempted `Loader.close()`.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CancelAvm2Load {
+    /// No load for this `LoaderInfo` was found at all.
+    NotFound,
+    /// A load was found, but it is not in progress: it already
+    /// completed, errored, or was cancelled by an earlier `close()`.
+    NotInProgress,
+    /// The in-flight load was cancelled.
+    Cancelled,
 }
 
 /// The completion status of a `Loader` loading a movie.
@@ -597,6 +682,14 @@ pub struct MovieLoader<'gc> {
     /// completed and we expect the Player to periodically tick preload
     /// until loading completes.
     movie: Option<SwfMovie<'gc>>,
+
+    /// Whether this load was cancelled via `Loader.close()`.
+    ///
+    /// A closed load stays cancelled: no further events are dispatched for
+    /// it and no content is attached. This is per-load state (a new load
+    /// creates a new `MovieLoader`), so `load()` after `close()` works.
+    #[collect(require_static)]
+    load_cancelled: bool,
 }
 
 impl<'gc> MovieLoader<'gc> {
@@ -708,6 +801,11 @@ impl<'gc> MovieLoader<'gc> {
 
                 if uc.load_manager.load_cancelled_avm1(handle) {
                     tracing::warn!("movie_loader: Target clip was already AVM1 removed");
+                    return Err(Error::Cancelled);
+                }
+
+                if uc.load_manager.load_cancelled_avm2(handle) {
+                    tracing::debug!("movie_loader: Load was closed via Loader.close()");
                     return Err(Error::Cancelled);
                 }
 
@@ -1680,6 +1778,11 @@ impl<'gc> MovieLoader<'gc> {
             return Ok(());
         }
 
+        if uc.load_manager.load_cancelled_avm2(handle) {
+            tracing::debug!("movie_loader_data: Load was closed via Loader.close()");
+            return Ok(());
+        }
+
         let domain = if let MovieLoaderVMData::Avm2 {
             context,
             default_domain,
@@ -2026,6 +2129,10 @@ impl<'gc> MovieLoader<'gc> {
             None => return Err(Error::Cancelled),
         };
 
+        if uc.load_manager.load_cancelled_avm2(handle) {
+            return Ok(());
+        }
+
         match vm_data {
             MovieLoaderVMData::Avm1 {
                 broadcaster,
@@ -2080,6 +2187,10 @@ impl<'gc> MovieLoader<'gc> {
             }) => (*target_clip, *vm_data, *movie),
             None => return Err(Error::Cancelled),
         };
+
+        if uc.load_manager.load_cancelled_avm2(handle) {
+            return Ok(());
+        }
 
         let loader_info = if let MovieLoaderVMData::Avm2 { loader_info, .. } = vm_data {
             Some(loader_info)
@@ -2256,6 +2367,10 @@ impl<'gc> MovieLoader<'gc> {
             }) => (*target_clip, *vm_data),
             None => return Err(Error::Cancelled),
         };
+
+        if uc.load_manager.load_cancelled_avm2(handle) {
+            return Ok(());
+        }
 
         // If the SWF can't be loaded, the MovieClip enters the error state
         if let Some(mc) = clip.as_movie_clip() {

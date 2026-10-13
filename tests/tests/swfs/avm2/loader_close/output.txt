@@ -1,0 +1,25 @@
+=== A: close() with no load in progress ===
+A close() THREW: id=2029 cls=flash.errors::IOError
+A right after [A] events=open:0 init:0 complete:0 ioerror:0 progress:0 contentNull=true bytesNull=true bytesLoaded=0 bytesTotal=0
+A 2 frames later [A] events=open:0 init:0 complete:0 ioerror:0 progress:0 contentNull=true bytesNull=true bytesLoaded=0 bytesTotal=0
+=== B: close() on an in-flight load ===
+B close(): no throw
+B same handler [B] events=open:0 init:0 complete:0 ioerror:0 progress:0 contentNull=true bytesNull=false bytesLoaded=0 bytesTotal=0
+B 30 frames later [B] events=open:0 init:0 complete:0 ioerror:0 progress:0 contentNull=true bytesNull=false bytesLoaded=0 bytesTotal=0
+=== B2: load() again on the same closed loader ===
+B right after reload [B] events=open:0 init:0 complete:0 ioerror:0 progress:0 contentNull=true bytesNull=false bytesLoaded=0 bytesTotal=0
+B 30 frames after reload [B] events=open:1 init:1 complete:1 ioerror:0 progress:2 contentNull=false bytesNull=false bytesLoaded=1198 bytesTotal=1198 childTicked=true
+=== C: close() after COMPLETE ===
+C before close (4 frames in) [C] events=open:1 init:1 complete:1 ioerror:0 progress:2 contentNull=false bytesNull=false bytesLoaded=1198 bytesTotal=1198 childTicked=true
+C close() THREW: id=2029 cls=flash.errors::IOError
+C after close [C] events=open:1 init:1 complete:1 ioerror:0 progress:2 contentNull=false bytesNull=false bytesLoaded=1198 bytesTotal=1198 childTicked=true
+C 4 frames later [C] events=open:1 init:1 complete:1 ioerror:0 progress:2 contentNull=false bytesNull=false bytesLoaded=1198 bytesTotal=1198 childTicked=true
+=== D: double close after COMPLETE ===
+D double close() THREW: id=2029 cls=flash.errors::IOError
+D after double close [D] events=open:1 init:1 complete:1 ioerror:0 progress:2 contentNull=false bytesNull=false bytesLoaded=1198 bytesTotal=1198 childTicked=true
+=== E: close() inside the COMPLETE handler ===
+E close() in COMPLETE handler THREW: id=2029 cls=flash.errors::IOError
+E inside handler [E] events=open:1 init:1 complete:1 ioerror:0 progress:2 contentNull=false bytesNull=false bytesLoaded=1198 bytesTotal=1198
+E 4 frames later [E] events=open:1 init:1 complete:1 ioerror:0 progress:2 contentNull=false bytesNull=false bytesLoaded=1198 bytesTotal=1198 childTicked=true
+PROBE_DONE
+PROBE_SOL_WRITTEN

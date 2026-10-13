@@ -5,7 +5,7 @@ use indexmap::IndexMap;
 
 use crate::avm2::ClassObject;
 use crate::avm2::activation::Activation;
-use crate::avm2::error::make_error_2007;
+use crate::avm2::error::{make_error_2007, make_error_2029};
 use crate::avm2::globals::flash::display::display_object::initialize_for_allocator;
 use crate::avm2::globals::slots::flash_display_loader as loader_slots;
 use crate::avm2::globals::slots::flash_net_url_request as url_request_slots;
@@ -20,8 +20,8 @@ use crate::avm2_stub_method;
 use crate::backend::navigator::{NavigationMethod, Request};
 use crate::display_object::LoaderDisplay;
 use crate::display_object::MovieClip;
-use crate::loader::LoadManager;
 use crate::loader::MovieLoaderVMData;
+use crate::loader::{CancelAvm2Load, LoadManager};
 use crate::tag_utils::{SwfMovie, SwfMovieData};
 use ruffle_common::tag_utils::LoadBytesInfo;
 
@@ -331,4 +331,43 @@ pub fn unload<'gc>(
     loader_info.unload(activation.context);
 
     Ok(Value::Undefined)
+}
+
+/// Implements `flash.display.Loader.close`.
+///
+/// Cancels the load that is currently in progress for this loader. Measured
+/// against a real Flash projector (see the `avm2/loader_close` test):
+///
+/// - With a load in flight, `close()` cancels it silently: no `open`,
+///   `progress`, `init`, `complete` or `ioError` event is dispatched
+///   afterwards, and no content is ever attached. The load is not reusable
+///   for anything else, but the loader itself is - a later `load()` works
+///   normally.
+/// - With no load in progress (never loaded, already completed - even from
+///   inside the `complete` handler - errored, or already closed), Flash
+///   throws `IOError: Error #2029`.
+pub fn close<'gc>(
+    activation: &mut Activation<'_, 'gc>,
+    this: Value<'gc>,
+    _args: FunctionArgs<'_, 'gc>,
+) -> Result<Value<'gc>, Error<'gc>> {
+    let this = this.as_object().unwrap();
+
+    let loader_info = this
+        .get_slot(loader_slots::_CONTENT_LOADER_INFO)
+        .as_object()
+        .unwrap();
+
+    let loader_info = loader_info.as_loader_info_object().unwrap();
+
+    match activation
+        .context
+        .load_manager
+        .cancel_avm2_load(loader_info)
+    {
+        CancelAvm2Load::Cancelled => Ok(Value::Undefined),
+        CancelAvm2Load::NotFound | CancelAvm2Load::NotInProgress => {
+            Err(make_error_2029(activation))
+        }
+    }
 }

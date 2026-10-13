@@ -1,0 +1,30 @@
+# What does `Loader.close()` actually do? `output.txt` is recorded from a real
+# Flash projector (jplt.exe), which embeds Flash Player:
+#
+# - With a load in flight, `close()` cancels it silently: no events at all
+#   fire afterwards (even `open`, which is asynchronous and never arrives),
+#   no content is attached, and the child never constructs. The loader stays
+#   usable - a later `load()` on it works normally.
+# - With no load in progress - never loaded, already completed (even when
+#   called from inside the `complete` handler), or already closed - Flash
+#   throws `IOError: Error #2029`.
+#
+# The child records its own observation in a SharedObject: reading a
+# nonexistent property off the sealed parent probe throws `Error #1069` in
+# real Flash, matching Ruffle (this closes the question left open by the
+# `loader_unload_and_stop_ticks` probe).
+num_ticks = 84
+
+[[compilers]]
+type = "Asc"
+target = "test.swf"
+class = "CloseProbe"
+scripts = ["CloseProbe.as"]
+swf_version = 41
+
+[[compilers]]
+type = "Asc"
+target = "child2.swf"
+class = "TickChild"
+scripts = ["TickChild.as"]
+swf_version = 41
